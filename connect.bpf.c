@@ -104,71 +104,61 @@ static inline int32_t AddParameter(
     const uint16_t size,
     const void* const data)
 {
-    if (!event)
-    {
-        return -EBPF_ERR_NO_EVENT;
-    }
+    char* const ev = (char*) event;
+    uint16_t offset = event->hdr.size & EBPF_MAX_EVENT_SIZE;
+    int32_t roomSize = EBPF_MAX_EVENT_SIZE - offset - sizeof(id);
 
-    if (!data || (size > PATH_MAX) || (size < 0))
-    {
-        return -EBPF_ERR_NO_DATA;
-    }
-
-    char* ptr = (char*)event;
-    char* const end = ptr + EBPF_MAX_EVENT_SIZE;
-    ptr += event->hdr.size;
-    char* maxEnd = end - sizeof(id);
-
-    if (ptr >= maxEnd)
+    if (roomSize < 0)
     {
         return -EBPF_ERR_NO_SPACE;
     }
 
-    if (bpf_probe_read(ptr, sizeof(id), &id))
+    if (bpf_probe_read(ev + offset, sizeof(id), &id))
     {
         return -EBPF_ERR_PROBE_READ_FAILED;
     }
 
-    ptr += sizeof(id);
-    maxEnd = end - sizeof(type);
+    offset += sizeof(id);
+    roomSize -= sizeof(type);
 
-    if (ptr >= maxEnd)
+    if (roomSize < 0)
     {
         return -EBPF_ERR_NO_SPACE;
     }
 
-    if (bpf_probe_read(ptr, sizeof(type), &type))
+    if (bpf_probe_read(ev + offset, sizeof(type), &type))
     {
         return -EBPF_ERR_PROBE_READ_FAILED;
     }
 
-    ptr += sizeof(type);
-    maxEnd = end - sizeof(size);
+    offset += sizeof(type);
+    roomSize -= sizeof(size);
 
-    if (ptr >= maxEnd)
+    if (roomSize < 0)
     {
         return -EBPF_ERR_NO_SPACE;
     }
 
-    if (bpf_probe_read(ptr, sizeof(size), &size))
+    if (bpf_probe_read(ev + offset, sizeof(size), &size))
     {
         return -EBPF_ERR_PROBE_READ_FAILED;
     }
 
-    ptr += sizeof(size);
-    maxEnd = end - size;
+    offset += sizeof(size);
+    roomSize -= size & 0x1FFF;
 
-    if (ptr >= maxEnd)
+    if (roomSize < 0)
     {
         return -EBPF_ERR_NO_SPACE;
     }
 
-    /* if (bpf_probe_read(ptr, size, data)) */
-    /* { */
-    /*     return -EBPF_ERR_PROBE_READ_FAILED; */
-    /* } */
+    if (bpf_probe_read(ev + (offset & 0x3FFF), size & 0x1FFF, data))
+    {
+        return -EBPF_ERR_PROBE_READ_FAILED;
+    }
 
-    event->hdr.size = ((ptr - (char*)(event)) + size);
+    offset += size;
+    event->hdr.size = offset;
     event->hdr.count++;
     return 0;
 }
