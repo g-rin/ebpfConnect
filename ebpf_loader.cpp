@@ -4,6 +4,7 @@
 #include <bpf/libbpf.h>
 #include <fstream>
 #include <getopt.h>
+#include <iomanip>
 #include <signal.h>
 #include <stdio.h>
 #include <sstream>
@@ -63,16 +64,92 @@ int LibBpfPrintCallback(
     return sz;
 }
 
+struct EbpfParameterHeader
+{
+    uint32_t id;
+    uint16_t type;
+    uint16_t size;
+} __attribute__((__packed__));
+
+struct EbpfParameter
+{
+    struct EbpfParameterHeader hdr;
+    uint8_t data[0];
+} __attribute__((__packed__));
+
+struct EbpfEventHeader
+{
+    uint64_t timestamp;
+    uint32_t count;
+    uint16_t type;
+    uint16_t size;
+} __attribute__((__packed__));
+
+struct EbpfEvent
+{
+    struct EbpfEventHeader hdr;
+    uint8_t parameters[0];
+} __attribute__((__packed__));
+
+std::string GetHexDump(const void* data, const size_t dataSize)
+{
+    std::ostringstream ss;
+    const char* p = reinterpret_cast<const char*>(data);
+    for (size_t i = 0; i < dataSize; ++i, ++p)
+    {
+        if (i && (0 ==(i % 4)))
+        {
+            ss << "|";
+        }
+
+        ss << std::hex << std::setw(2) << std::setfill('0') << std::right;
+        ss << (static_cast<int>(*p) & 0xFF);
+    }
+    return ss.str();
+}
+
+void PrintParameters(
+    const EbpfParameter* const param,
+    const uint16_t count)
+{
+    std::cout
+        << "\n\t{id: " << param->hdr.id
+        << ", type: " << param->hdr.type
+        << ", size: " << param->hdr.size
+        << ", data: " << GetHexDump(param->data, param->hdr.size) << "}";
+
+    if (count > 1)
+    {
+        const EbpfParameter* const next =
+            reinterpret_cast<const EbpfParameter*>(
+                reinterpret_cast<const char*>(param)
+                + sizeof(EbpfParameterHeader)
+                + param->hdr.size);
+
+        PrintParameters(next, count - 1);
+    }
+}
+
 void EventReceivedCallback(
     void *ctx,
     int cpu,
     void *data,
     uint32_t size)
 {
+    const auto* event = reinterpret_cast<EbpfEvent*>(data);
+
     std::cout
-        << __PRETTY_FUNCTION__
-        << " [" << cpu << "] size: " << size
-        << std::endl;
+        << "timestamp: " << event->hdr.timestamp
+        << ", type: " << event->hdr.type
+        << ", count: " << event->hdr.count
+        << ", size: " << event->hdr.size;
+
+    PrintParameters(
+        reinterpret_cast<EbpfParameter*>(
+            reinterpret_cast<char*>(data) + sizeof(EbpfEventHeader)),
+        event->hdr.count);
+
+    std::cout << std::endl;
 }
 
 void EventLostCallback(
@@ -92,7 +169,7 @@ void ErrorReceivedCallback(
     void *data,
     uint32_t size)
 {
-    uint32_t errorCode;
+    int32_t errorCode;
 
     if (size < sizeof(errorCode))
     {
@@ -105,12 +182,13 @@ void ErrorReceivedCallback(
     }
 
     errorCode = *(reinterpret_cast<uint32_t*>(data));
+    const char* text = reinterpret_cast<char*>(data) + sizeof(errorCode);
+    const auto textSize = strnlen(text, size - sizeof(errorCode));
+    const std::string_view description(text, textSize);
 
-    const std::string_view description(
-        reinterpret_cast<char*>(data) + sizeof(errorCode),
-        size - sizeof(errorCode));
-
-    std::cout << "Error [" << errorCode << "]: " << description << std::endl;
+    std::cout
+        << "Error [0x" << GetHexDump(&errorCode, sizeof(errorCode)) << "]: "
+        << description << std::endl;
 }
 
 void ErrorLostCallback(

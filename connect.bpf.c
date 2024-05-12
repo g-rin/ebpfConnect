@@ -1,6 +1,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
+#include <limits.h>
 
 enum
 {
@@ -39,7 +40,7 @@ struct
 __attribute__((always_inline))
 static inline void SendError(
     void* ctx,
-    const uint32_t errorCode,
+    const int32_t errorCode,
     char* const msg,
     const size_t msgSize)
 {
@@ -81,21 +82,22 @@ struct EbpfParameter
 struct EbpfEventHeader
 {
     uint64_t timestamp;
+    uint32_t count;
     uint16_t type;
-    uint16_t count;
     uint16_t size;
 } __attribute__((__packed__));
 
 struct EbpfEvent
 {
     struct EbpfEventHeader hdr;
-    struct EbpfParameter parameters[0];
+    uint8_t parameters[0];
 } __attribute__((__packed__));
 
-#define EBPF_MAX_EVENT_SIZE 32768
+#define EBPF_MAX_EVENT_SIZE 0x7FFF
 
 __attribute__((always_inline))
-static inline int AddParameter(
+static inline int32_t AddParameter(
+    void* ctx,
     struct EbpfEvent* const event,
     const uint32_t id,
     const uint16_t type,
@@ -107,52 +109,75 @@ static inline int AddParameter(
         return -EBPF_ERR_NO_EVENT;
     }
 
-    if (!data)
+    if (!data || (size > PATH_MAX) || (size < 0))
     {
         return -EBPF_ERR_NO_DATA;
     }
 
-    static const size_t paramHeaderSize = sizeof(struct EbpfParameterHeader);
-    static const size_t evHeaderSize = sizeof(struct EbpfEventHeader);
-    const size_t parameterSize = paramHeaderSize + size;
-    const size_t finalSize = evHeaderSize + event->hdr.size + parameterSize;
+    char* ptr = (char*)event;
+    char* const end = ptr + EBPF_MAX_EVENT_SIZE;
+    ptr += event->hdr.size;
+    char* maxEnd = end - sizeof(id);
 
-    if (finalSize >= EBPF_MAX_EVENT_SIZE)
+    if (ptr >= maxEnd)
     {
         return -EBPF_ERR_NO_SPACE;
     }
 
-    void* end = (void*)(event + evHeaderSize + event->hdr.size);
-    struct EbpfParameter* const param = (struct EbpfParameter*)(end);
-
-    if (!param)
-    {
-        return -EBPF_ERR_NO_SPACE;
-    }
-
-    param->hdr.id = id;
-    param->hdr.type = type;
-    param->hdr.size = size;
-
-    if (bpf_probe_read(&param->data[0], size, data))
+    if (bpf_probe_read(ptr, sizeof(id), &id))
     {
         return -EBPF_ERR_PROBE_READ_FAILED;
     }
 
-    event->hdr.count++;
-    event->hdr.size += parameterSize;
+    ptr += sizeof(id);
+    maxEnd = end - sizeof(type);
 
-    if (event->hdr.size % 8)
+    if (ptr >= maxEnd)
     {
-        event->hdr.size += 8 - (event->hdr.size % 8);
+        return -EBPF_ERR_NO_SPACE;
     }
 
+    if (bpf_probe_read(ptr, sizeof(type), &type))
+    {
+        return -EBPF_ERR_PROBE_READ_FAILED;
+    }
+
+    ptr += sizeof(type);
+    maxEnd = end - sizeof(size);
+
+    if (ptr >= maxEnd)
+    {
+        return -EBPF_ERR_NO_SPACE;
+    }
+
+    if (bpf_probe_read(ptr, sizeof(size), &size))
+    {
+        return -EBPF_ERR_PROBE_READ_FAILED;
+    }
+
+    ptr += sizeof(size);
+    maxEnd = end - size;
+
+    if (ptr >= maxEnd)
+    {
+        return -EBPF_ERR_NO_SPACE;
+    }
+
+    /* if (bpf_probe_read(ptr, size, data)) */
+    /* { */
+    /*     return -EBPF_ERR_PROBE_READ_FAILED; */
+    /* } */
+
+    event->hdr.size = ((ptr - (char*)(event)) + size);
+    event->hdr.count++;
     return 0;
 }
 
 enum
 {
-    tept_unknown,
+    tept__BEGIN = 0x300,
+
+    tept_unknown = tept__BEGIN,
     tept_int8,
     tept_uint8,
     tept_int16,
@@ -162,43 +187,64 @@ enum
     tept_int64,
     tept_uint64,
     tept_rawData,
+
+    tept__END
 };
 
 __attribute__((always_inline))
-static inline int AddParameterU32(
+static inline int32_t AddParameterU32(
+    void* ctx,
     struct EbpfEvent* const event,
     const uint32_t id,
     const uint32_t value)
 {
-    return AddParameter(event,id,tept_uint32,(uint16_t)sizeof(value), &value);
+    return AddParameter(ctx,event,id,tept_uint32,(uint16_t)sizeof(value), &value);
 }
 
 __attribute__((always_inline))
-static inline int AddParameterU64(
+static inline int32_t AddParameterU64(
+    void* ctx,
     struct EbpfEvent* const event,
     const uint32_t id,
     const uint64_t value)
 {
-    return AddParameter(event,id,tept_uint64,(uint16_t)sizeof(value),&value);
+    return AddParameter(ctx,event,id,tept_uint64,(uint16_t)sizeof(value),&value);
 }
 
 enum
 {
-    tepid_pid,
+    tepid__BEGIN = 0x400,
+
+    tepid_pid = tepid__BEGIN,
     tepid_tid,
     tepid_syscallId,
     tepid_socketFd,
     tepid_addressLength,
     tepid_socketAddress,
+
+    tepid__END
 };
 
 struct
 {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(int));
-    __uint(value_size, EBPF_MAX_EVENT_SIZE);
+    __uint(value_size, EBPF_MAX_EVENT_SIZE + 1);
     __uint(max_entries, 1);
 } EventStorage SEC(".maps");
+
+#define DumpEvent(ctx, msg, event)\
+    ({\
+        SEND_ERROR(ctx, "Dump ["msg"] timestamp[low]", *(uint32_t*)((char*)(event) + 0));\
+        SEND_ERROR(ctx, "Dump ["msg"] timestamp[high]", *(uint32_t*)((char*)(event) + 4));\
+        SEND_ERROR(ctx, "Dump ["msg"] [type&count]", *(uint32_t*)((char*)(event) + 8));\
+        SEND_ERROR(ctx, "Dump ["msg"] [size&p.id.high]", *(uint32_t*)((char*)(event) + 12));\
+        SEND_ERROR(ctx, "Dump ["msg"] 5", *(uint32_t*)((char*)(event) + 16));\
+        SEND_ERROR(ctx, "Dump ["msg"] 6", *(uint32_t*)((char*)(event) + 20));\
+        SEND_ERROR(ctx, "Dump ["msg"] 7", *(uint32_t*)((char*)(event) + 24));\
+        SEND_ERROR(ctx, "Dump ["msg"] 8", *(uint32_t*)((char*)(event) + 28));\
+    })
+
 
 __attribute__((always_inline))
 static inline struct EbpfEvent* CreateEvent(
@@ -217,31 +263,39 @@ static inline struct EbpfEvent* CreateEvent(
         return NULL;
     }
 
+    //DumpEvent(ctx, "initial", event);
+
     event->hdr.timestamp = bpf_ktime_get_ns();
-    event->hdr.type = type;
     event->hdr.count = 0;
-    event->hdr.size = 0;
+    event->hdr.type = type;
+    event->hdr.size = sizeof(struct EbpfEventHeader);
+
+    //DumpEvent(ctx, "ev.header initialized", event);
 
     if (pidTgid)
     {
         const uint64_t mask = 0xFFFFFFFF;
         const uint32_t pid = (pidTgid >> 32) & mask;
-        uint32_t errorCode = AddParameterU32(event, tepid_pid, pid);
+        int32_t errorCode = AddParameterU32(ctx,event, tepid_pid, pid);
 
-        if (errorCode)
+        if (errorCode < 0)
         {
             SEND_ERROR(ctx, "Couldn't set 'pid'.", errorCode);
             return NULL;
         }
 
-        const uint32_t tid = pidTgid & mask;
-        errorCode = AddParameterU32(event, tepid_tid, tid);
+        //DumpEvent(ctx, "pid added", event);
 
-        if (errorCode)
+        const uint32_t tid = pidTgid & mask;
+        errorCode = AddParameterU32(ctx,event, tepid_tid, tid);
+
+        if (errorCode < 0)
         {
             SEND_ERROR(ctx, "Couldn't set 'tid'.", errorCode);
             return NULL;
         }
+
+        //DumpEvent(ctx, "tid added", event);
     }
 
     return event;
@@ -257,14 +311,14 @@ struct
 __attribute__((always_inline))
 static inline bool SendEvent(void* ctx, struct EbpfEvent* event)
 {
-    static const size_t evHeaderSize = sizeof(struct EbpfEventHeader);
+    //DumpEvent(ctx, "SendEvent", event);
 
     return !bpf_perf_event_output(
         ctx,
         &EbpfEventPipe,
         BPF_F_CURRENT_CPU,
         event,
-        evHeaderSize + event->hdr.size);
+        event->hdr.size & EBPF_MAX_EVENT_SIZE);
 }
 
 SEC("tp/syscalls/sys_enter_connect")
@@ -288,9 +342,10 @@ int OnConnectEnter(struct trace_event_raw_sys_enter* ctx)
     }
 
     uint32_t errorCode = AddParameterU32(
-            event,
-            tepid_syscallId,
-            BPF_CORE_READ(ctx, id));
+        ctx,
+        event,
+        tepid_syscallId,
+        BPF_CORE_READ(ctx, id));
 
     if (errorCode)
     {
@@ -299,9 +354,10 @@ int OnConnectEnter(struct trace_event_raw_sys_enter* ctx)
     }
 
     errorCode = AddParameterU64(
-            event,
-            tepid_socketFd,
-            BPF_CORE_READ(ctx, args[0]));
+        ctx,
+        event,
+        tepid_socketFd,
+        BPF_CORE_READ(ctx, args[0]));
 
     if (errorCode)
     {
@@ -321,7 +377,7 @@ int OnConnectEnter(struct trace_event_raw_sys_enter* ctx)
         return 0;
     }
 
-    errorCode = AddParameterU64(event, tepid_addressLength, addrlen);
+    errorCode = AddParameterU64(ctx,event, tepid_addressLength, addrlen);
 
     if (errorCode)
     {
@@ -330,17 +386,19 @@ int OnConnectEnter(struct trace_event_raw_sys_enter* ctx)
     }
 
     errorCode = AddParameter(
-            event,
-            tepid_socketAddress,
-            tept_rawData,
-            (const uint16_t) addrlen,
-            (const void*) BPF_CORE_READ(ctx, args[1]));
+        ctx,
+        event,
+        tepid_socketAddress,
+        tept_rawData,
+        (const uint16_t) addrlen,
+        (const void*) BPF_CORE_READ(ctx, args[1]));
 
     if (errorCode)
     {
         SEND_ERROR(ctx, "connect (enter): 'addr'", errorCode);
     }
 
+    SendEvent(ctx, event);
     return 0;
 }
 
