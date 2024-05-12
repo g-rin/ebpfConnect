@@ -34,8 +34,9 @@ int LibBpfPrintCallback(
     const char *format,
     va_list args)
 {
-    char buf[BUFSIZ];
-    const int sz = vsnprintf(buf, BUFSIZ, format, args);
+    size_t bufSize = 32*BUFSIZ;
+    char buf[bufSize];
+    const int sz = vsnprintf(buf, bufSize, format, args);
 
     if (sz > 0)
     {
